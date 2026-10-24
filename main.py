@@ -9,7 +9,7 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
 def init_db():
-    conn = sqlite3.connect('data/farm.db')
+    conn = sqlite3.connect('farm.db')
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -26,7 +26,7 @@ def init_db():
     conn.close()
 
 def get_user(user_id):
-    conn = sqlite3.connect('data/farm.db')
+    conn = sqlite3.connect('farm.db')
     cursor = conn.cursor()
     cursor.execute('SELECT level, exp, coins, planted, products, cooking FROM users WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
@@ -66,7 +66,7 @@ def add_rewards(user_id, exp_to_add, coins_to_add, planted_to_add=0):
         new_level += 1
         max_exp = get_max_exp(new_level)
 
-    conn = sqlite3.connect('data/farm.db')
+    conn = sqlite3.connect('farm.db')
     cursor = conn.cursor()
     cursor.execute('''
         UPDATE users 
