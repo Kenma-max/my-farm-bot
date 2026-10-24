@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
@@ -6,6 +7,74 @@ TOKEN = "8268662609:AAE0amVm4aRZGC-HcHC5G4ktq1h7EybTWTc"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
+
+def init_db():
+    conn = sqlite3.connect('data/farm.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            level INTEGER DEFAULT 0,
+            exp INTEGER DEFAULT 0,
+            coins INTEGER DEFAULT 0,
+            planted INTEGER DEFAULT 0,
+            products INTEGER DEFAULT 0,
+            cooking INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_user(user_id):
+    conn = sqlite3.connect('data/farm.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT level, exp, coins, planted, products, cooking FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    
+    if row is None:
+        cursor.execute('INSERT INTO users (user_id) VALUES (?)', (user_id,))
+        conn.commit()
+        row = (0, 0, 0, 0, 0, 0) 
+        
+    conn.close()
+    return {
+        'level': row[0],
+        'exp': row[1],
+        'coins': row[2],
+        'planted': row[3],
+        'products': row[4],
+        'cooking': row[5]
+    }
+
+def get_max_exp(level):
+    if level == 0:
+        return 50
+    return level * 100
+
+def add_rewards(user_id, exp_to_add, coins_to_add, planted_to_add=0):
+    user = get_user(user_id)
+    
+    new_exp = user['exp'] + exp_to_add
+    new_coins = user['coins'] + coins_to_add
+    new_planted = user['planted'] + planted_to_add
+    new_level = user['level']
+    
+    max_exp = get_max_exp(new_level)
+    
+    while new_exp >= max_exp:
+        new_exp -= max_exp
+        new_level += 1
+        max_exp = get_max_exp(new_level)
+
+    conn = sqlite3.connect('data/farm.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE users 
+        SET level = ?, exp = ?, coins = ?, planted = ?
+        WHERE user_id = ?
+    ''', (new_level, new_exp, new_coins, new_planted, user_id))
+    conn.commit()
+    conn.close()
 
 def get_bottom_keyboard():
     reply_kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -73,6 +142,47 @@ async def welcome(massage: types.Message):
 async def menu_button_pressed(message: types.Message):
     await send_main_menu(message.chat.id)
 
+@dp.message_handler(commands=['add_test_crop'])
+async def test_crop_reward(message: types.Message):
+    add_rewards(message.from_user.id, exp_to_add=10, coins_to_add=15, planted_to_add=1)
+    await message.reply("🥕 Вы вырастили морковь! Получено: +10 Опыта, +15 Монет!")
+
+@dp.callback_query_handler(lambda c: c.data == 'farm')
+async def process_farm(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    user_data = get_user(user_id)
+    max_exp = get_max_exp(user_data['level'])
+    
+    farm_text = (
+        f"🌾 **Моя ферма**\n\n"
+        f"Опыт: {user_data['exp']}/{max_exp}\n"
+        f"Твой уровень: {user_data['level']}\n"
+        f"Монеты: {user_data['coins']}\n"
+        f"Всего посажено: {user_data['planted']}\n"
+        f"Продукты: {user_data['products']}\n"
+        f"Готовка: {user_data['cooking']}"
+    )
+    
+    try:
+        await bot.edit_message_caption(
+            chat_id=user_id,
+            message_id=callback_query.message.message_id,
+            caption=farm_text,
+            reply_markup=None,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=callback_query.message.message_id,
+            text=farm_text,
+            reply_markup=None,
+            parse_mode="Markdown"
+        )
+
+
 @dp.callback_query_handler(lambda c: c.data == 'rules')
 async def process_rules(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
@@ -109,3 +219,4 @@ if __name__ == '__main__':
     asyncio.set_event_loop(loop)
     print("Ферма запущена!")
     executor.start_polling(dp, skip_updates=True, loop=loop)
+ 
