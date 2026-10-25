@@ -32,37 +32,14 @@ def init_db():
     import os
     if not os.path.exists('/data'):
         os.makedirs('/data', exist_ok=True)
-
+    
     conn = sqlite3.connect('/data/farm.db')
     cursor = conn.cursor()
-    conn.execute('''CREATE TABLE IF NOT EXISTS users (...)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS farmlands (...)''')
+    
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, level INTEGER DEFAULT 0, exp INTEGER DEFAULT 0, coins INTEGER DEFAULT 0, planted INTEGER DEFAULT 0, products INTEGER DEFAULT 0, cooking INTEGER DEFAULT 0, farmlands_count INTEGER DEFAULT 1)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS farmlands (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, farmland_number INTEGER, plant_type TEXT, plant_time TEXT, harvest_time TEXT)''')
+    
     conn.commit()
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            level INTEGER DEFAULT 0,
-            exp INTEGER DEFAULT 0,
-            coins INTEGER DEFAULT 0,
-            planted INTEGER DEFAULT 0,
-            products INTEGER DEFAULT 0,
-            cooking INTEGER DEFAULT 0
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS farmlands (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            farmland_number INTEGER NOT NULL,
-            plant_type TEXT,             
-            plant_time TEXT,             
-            harvest_time TEXT,             
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
-        )
-    ''')
-    conn.commit()
-    conn.close()
 
 def get_user(user_id):
     conn = sqlite3.connect('/data/farm.db')
@@ -75,7 +52,6 @@ def get_user(user_id):
         conn.commit()
         row = (0, 0, 0, 0, 0, 0) 
         
-    conn.close()
     return {
         'level': row[0],
         'exp': row[1],
@@ -100,7 +76,6 @@ def update_user_data(user_id, **kwargs):
         values.append(user_id)
         cursor.execute(query, tuple(values))
         conn.commit()
-    conn.close()
 
 def get_max_exp(level):
     if level == 0:
@@ -130,7 +105,6 @@ def add_rewards(user_id, exp_to_add, coins_to_add, planted_to_add=0):
         WHERE user_id = ?
     ''', (new_level, new_exp, new_coins, new_planted, user_id))
     conn.commit()
-    conn.close()
 
 def get_farmlands(user_id):
     conn = sqlite3.connect('/data/farm.db')
@@ -144,7 +118,6 @@ def get_farmlands(user_id):
             'plant_time': datetime.fromisoformat(row[2]) if row[2] else None,
             'harvest_time': datetime.fromisoformat(row[3]) if row[3] else None
         })
-    conn.close()
     return farmlands
 
 def get_farmland_status_text(farmland_data):
@@ -285,7 +258,6 @@ async def reset_user_profile(message: types.Message):
         WHERE user_id = ?
     ''', (message.from_user.id,))
     conn.commit()
-    conn.close()
     await message.reply("🧹 Твой профиль полностью обнулен! Ты снова бомж 0 уровня!")
 
 @dp.callback_query_handler(lambda c: c.data == 'farm')
@@ -410,7 +382,6 @@ HERE user_id = ? AND farmland_number = ?
         ''', (user_id, farmland_number, seed_key, plant_time.isoformat(), harvest_time.isoformat()))
     
     conn.commit()
-    conn.close()
 
     response_text = (
         f"Ты посадил **{plant_name}** на Грядке {farmland_number}! 🌱\n\n"
