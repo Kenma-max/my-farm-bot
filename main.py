@@ -2,13 +2,32 @@ import asyncio
 import sqlite3
 import os
 from datetime import datetime, timedelta
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
 
+# 1. Объявляем переменные
+ADMIN_CHAT_ID = -5560765603
 TOKEN = "8268662609:AAE0amVm4aRZGC-HcHC5G4ktq1h7EybTWTc"
 
+# 2. Создаем бота и хранилище состояний
 bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+# 3. Состояния
+class FarmStates(StatesGroup):
+    waiting_for_photos = State()
+
+# 4. База данных
+if not os.path.exists('/data'):
+    os.makedirs('/data', exist_ok=True)
+db_conn = sqlite3.connect('/data/farm.db', check_same_thread=False)
+db_cursor = db_conn.cursor()
+
 
 if not os.path.exists('/data'):
     os.makedirs('/data', exist_ok=True)
@@ -44,13 +63,13 @@ def init_db():
 def get_user(user_id):
     conn = sqlite3.connect('/data/farm.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT level, exp, coins, planted, products, cooking FROM users WHERE user_id = ?', (user_id,))
+    cursor.execute('SELECT level, exp, coins, planted, products, cooking, farmlands_count FROM users WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     
     if row is None:
         cursor.execute('INSERT INTO users (user_id) VALUES (?)', (user_id,))
         conn.commit()
-        row = (0, 0, 0, 0, 0, 0) 
+        row = (0, 0, 0, 0, 0, 0, 1) 
         
     return {
         'level': row[0],
@@ -58,7 +77,8 @@ def get_user(user_id):
         'coins': row[2],
         'planted': row[3],
         'products': row[4],
-        'cooking': row[5]
+        'cooking': row[5],
+        'farmlands_count': row[6]
     }
 
 def update_user_data(user_id, **kwargs):
@@ -344,64 +364,133 @@ async def select_seed_to_plant(callback_query: types.CallbackQuery):
             parse_mode="Markdown"
         )
 
+# 1. Когда юзер жмет на конкретное семя (например, "Морковь")
 @dp.callback_query_handler(lambda c: c.data.startswith('seed_'))
-async def plant_selected_seed(callback_query: types.CallbackQuery):
+async def choose_seed_finish(callback_query: types.CallbackQuery):
     await callback_query.answer()
     
+    # Формат callback_data был: seed_carrot_on_1
     parts = callback_query.data.split('_')
-    seed_key = parts[1]
-    farmland_number = int(parts[3])
-    user_id = callback_query.from_user.id
+    seed_key = parts[1]       # например, carrot
+    farmland_number = parts[3] # например, 1
     
-    plant_name = PLANTS_DATA.get(seed_key, {}).get('name', 'Неизвестное растение')
+    plant_name = PLANTS_DATA.get(seed_key, {}).get('name', 'Растение')
+    
+    text = (
+        f"🌱 Ты выбрала: **{plant_name}** для Грядки №{farmland_number}!\n\n"
+        f"📝 **Задание от Хозяйки:**\n"
+        f"1. Возьми раскраску и сфоткай чистую (ДО).\n"
+        f"2. Раскрась и сфоткай готовую (ПОСЛЕ).\n"
+        f"3. Нажми кнопку ниже и пришли оба фото!"
+    )
+    
+    # Клавиатура с кнопкой "Сдать работу"
+    kb = types.InlineKeyboardMarkup()
+    # Зашиваем в callback семя и номер грядки: submit_carrot_1
+    kb.add(types.InlineKeyboardButton("📤 Сдать работу", callback_data=f"submit_{seed_key}_{farmland_number}"))
+    kb.add(types.InlineKeyboardButton("◀️ Отмена", callback_data="beds"))
+
+    try:
+        await callback_query.message.edit_caption(caption=text, reply_markup=kb, parse_mode="Markdown")
+    except Exception:
+        await callback_query.message.edit_text(text=text, reply_markup=kb, parse_mode="Markdown")
+
+
+# 2. Когда юзер жмет "Сдать работу"
+@dp.callback_query_handler(lambda c: c.data.startswith('submit_'))
+async def submit_work(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+    _, seed_key, farmland_number = callback_query.data.split('_')
+    
+    # Сохраняем в память бота, какое семя и на какую грядку он сажает
+    await state.update_data(seed_key=seed_key, farmland_number=farmland_number, user_id=callback_query.from_user.id)
+    await FarmStates.waiting_for_photos.set() # Включаем режим ожидания фото
+    
+    text = "📸 Жду твою работу с нетерпением! Пришли фото ДО и ПОСЛЕ (можно два фото по очереди или альбомом)."
+    
+    try:
+        await callback_query.message.edit_caption(caption=text, reply_markup=None, parse_mode="Markdown")
+    except Exception:
+        await callback_query.message.edit_text(text=text, reply_markup=None, parse_mode="Markdown")
+
+
+# 3. Прием фото от юзера и отправка в АДМИН-ЧАТ
+@dp.message_handler(content_types=['photo'], state=FarmStates.waiting_for_photos)
+async def get_photos(message: types.Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    data = await state.get_data()
+    
+    # Кнопки для тебя (админа) в админ-чате
+    kb = types.InlineKeyboardMarkup()
+    # Зашиваем в callback одобрения: approve_USERID_SEED_BED
+    kb.add(types.InlineKeyboardButton("✅ Принять", callback_data=f"approve_{data['user_id']}_{data['seed_key']}_{data['farmland_number']}"))
+    kb.add(types.InlineKeyboardButton("❌ Отказать", callback_data=f"reject_{data['user_id']}"))
+    
+    # Отправляем в админ-чат
+    await bot.send_photo(
+        ADMIN_CHAT_ID, 
+        photo_id, 
+        caption=f"🔔 Новая работа от игрока @{message.from_user.username or message.from_user.first_name}!\nСажает: {data['seed_key']} на грядку №{data['farmland_number']}", 
+        reply_markup=kb
+    )
+    
+    await message.reply("✅ Работа отправлена Хозяйке на проверку! Ожидай ответа.")
+    await state.finish() # Выключаем режим ожидания
+
+
+# 4. Когда админ жмет "Принять" в админ-чате
+@dp.callback_query_handler(lambda c: c.data.startswith('approve_'))
+async def approve_work(callback_query: types.CallbackQuery):
+    await callback_query.answer("Работа принята!")
+    
+    _, user_id, seed_key, farmland_number = callback_query.data.split('_')
+    user_id = int(user_id)
+    farmland_number = int(farmland_number)
+    
     grow_time_minutes = PLANTS_DATA.get(seed_key, {}).get('grow_time_minutes', 30)
+    plant_name = PLANTS_DATA.get(seed_key, {}).get('name', 'Растение')
     
+    # ТЕПЕРЬ САМА ПОСАДКА В БАЗУ (после одобрения админом!)
     plant_time = datetime.now()
     harvest_time = plant_time + timedelta(minutes=grow_time_minutes)
     
-    conn = sqlite3.connect('/data/farm.db')
-    cursor = conn.cursor()
-    
-    # Проверяем, существует ли уже запись для этой грядки
-    cursor.execute('SELECT id FROM farmlands WHERE user_id = ? AND farmland_number = ?', (user_id, farmland_number))
-    existing_farmland = cursor.fetchone()
-
-    if existing_farmland:
-        # Обновляем существующую грядку
-        cursor.execute('''
+    db_cursor.execute('SELECT id FROM farmlands WHERE user_id = ? AND farmland_number = ?', (user_id, farmland_number))
+    if db_cursor.fetchone():
+        db_cursor.execute('''
             UPDATE farmlands 
             SET plant_type = ?, plant_time = ?, harvest_time = ? 
-            W
-HERE user_id = ? AND farmland_number = ?
+            WHERE user_id = ? AND farmland_number = ?
         ''', (seed_key, plant_time.isoformat(), harvest_time.isoformat(), user_id, farmland_number))
     else:
-        # Создаем новую запись для грядки
-        cursor.execute('''
+        db_cursor.execute('''
             INSERT INTO farmlands (user_id, farmland_number, plant_type, plant_time, harvest_time) 
             VALUES (?, ?, ?, ?, ?)
         ''', (user_id, farmland_number, seed_key, plant_time.isoformat(), harvest_time.isoformat()))
+    db_conn.commit()
     
-    conn.commit()
-
-    response_text = (
-        f"Ты посадил **{plant_name}** на Грядке {farmland_number}! 🌱\n\n"
-        f"👩‍🎨 Чтобы ускорить рост, раскрась любую картинку, пришли фото ДО и ПОСЛЕ Хозяйке.\n"
-        f"⏳ Твой урожай будет готов через **{grow_time_minutes} минут**!"
+    # Сообщение игроку
+    await bot.send_message(
+        user_id, 
+        f"🎉 Хозяйка приняла твою работу!\n"
+        f"🌱 **{plant_name}** посажена на грядку №{farmland_number}!\n"
+        f"⏳ Урожай созреет через **{grow_time_minutes} минут**."
     )
     
-    try:
-        await callback_query.message.edit_caption(
-            caption=response_text,
-            reply_markup=get_farmland_keyboard(user_id), # Возвращаемся к списку грядок
-            parse_mode="Markdown"
-        )
-    except Exception:
-        await callback_query.message.edit_text(
-            text=response_text,
-            reply_markup=get_farmland_keyboard(user_id), # Возвращаемся к списку грядок
-            parse_mode="Markdown"
-        )
+    # Обновляем сообщение в админ-чате
+    await callback_query.message.edit_caption(
+        caption=f"✅ Одобрено! Растение посажено на грядку №{farmland_number}.",
+        reply_markup=None
+    )
 
+
+# 5. Когда админ жмет "Отказать"
+@dp.callback_query_handler(lambda c: c.data.startswith('reject_'))
+async def reject_work(callback_query: types.CallbackQuery):
+    await callback_query.answer("Работа отклонена.")
+    _, user_id = callback_query.data.split('_')
+    
+    await bot.send_message(int(user_id), "❌ Хозяйка отклонила работу. Попробуй переделать фото и отправить заново!")
+    await callback_query.message.edit_caption(caption="❌ Отклонено.", reply_markup=None)
 
 @dp.callback_query_handler(lambda c: c.data == 'rules')
 async def process_rules(callback_query: types.CallbackQuery):
@@ -435,6 +524,7 @@ async def process_rules(callback_query: types.CallbackQuery):
         )
 
 if __name__ == '__main__':
+    init_db()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     print("Ферма запущена!")
