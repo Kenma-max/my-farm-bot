@@ -187,29 +187,44 @@ def get_main_inline_keyboard():
     return inline_kb
 
 def get_farmland_keyboard(user_id):
-    """Клавиатура с грядками пользователя."""
+    """Клавиатура с грядками пользователя. Если грядка занята — показывает статус таймером."""
     inline_kb = types.InlineKeyboardMarkup(row_width=1)
     user_farmlands_count = get_user(user_id)['farmlands_count']
-    current_farmlands = get_farmlands(user_id) # Получаем реальные данные грядок
+    current_farmlands = get_farmlands(user_id) # Получаем данные о посадках из БД
 
     for i in range(1, user_farmlands_count + 1):
-        # Находим данные для этой грядки
-        farmland_data = next((f for f in current_farmlands if f['number'] == i), {'number': i, 'plant_type': None})
+        # Ищем, занята ли эта грядка
+        farmland_data = next((f for f in current_farmlands if f['number'] == i), {'number': i, 'plant_type': None, 'harvest_time': None})
         
-        status_text = get_farmland_status_text(farmland_data)
-        
-        if farmland_data['plant_type'] and datetime.now() >= farmland_data['harvest_time']:
-            # Если растение созрело - кнопка "Собрать"
-            inline_kb.add(types.InlineKeyboardButton(f"Грядка {i}: {status_text}", callback_data=f"harvest_{i}"))
-        elif farmland_data['plant_type']:
-            # Если растение растет - кнопка "Посмотреть статус" (или ничего)
-            inline_kb.add(types.InlineKeyboardButton(f"Грядка {i}: {status_text}", callback_data=f"farmland_status_{i}"))
-        else:
-            # Если грядка пуста - кнопка "Посадить"
-            inline_kb.add(types.InlineKeyboardButton(f"Грядка {i}: {status_text}", callback_data=f"plant_seed_{i}"))
+        if farmland_data['plant_type']:
+            # ГРЯДКА ЗАНЯТА: Считаем, сколько осталось времени
+            plant_name = PLANTS_DATA.get(farmland_data['plant_type'], {}).get('name', 'Растение')
             
-    inline_kb.add(types.InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu"))
+            if datetime.now() >= farmland_data['harvest_time']:
+                # Время вышло — можно собирать! (сделаем эту кнопку кликабельной для сбора)
+                inline_kb.add(types.InlineKeyboardButton(f"🟢 Грядка {i}: {plant_name} — ГОТОВО К СБОРУ!", callback_data=f"harvest_{i}"))
+            else:
+                # Еще растет — показываем таймер (НЕ семена!)
+                time_left = farmland_data['harvest_time'] - datetime.now()
+                hours, remainder = divmod(int(time_left.total_seconds()), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                
+                time_str = f"{minutes} мин."
+                if hours > 0:
+                    time_str = f"{hours} ч. {minutes} мин."
+                
+                # Кнопка неактивна или просто информирует о статусе (при клике покажем всплывающее окно)
+                inline_kb.add(types.InlineKeyboardButton(f"⏳ Грядка {i}: {plant_name} — {time_str}", callback_data=f"bed_busy_{i}"))
+        else:
+            # ГРЯДКА СВОБОДНА: Даем кнопку посадить семена
+            inline_kb.add(types.InlineKeyboardButton(f"⚪ Грядка {i}: Пусто (Посадить)", callback_data=f"plant_seed_{i}"))
+    
     return inline_kb
+
+@dp.callback_query_handler(lambda c: c.data.startswith('bed_busy_'))
+async def process_busy_bed(callback_query: types.CallbackQuery):
+    # Показываем всплывающее окошко с текстом
+    await callback_query.answer("🌱 Эта грядка уже занята! Дождись созревания урожая.", show_alert=True)
 
 def get_seeds_keyboard(farmland_number):
     """Клавиатура для выбора семян."""
@@ -491,6 +506,49 @@ async def reject_work(callback_query: types.CallbackQuery):
     
     await bot.send_message(int(user_id), "❌ Хозяйка отклонила работу. Попробуй переделать фото и отправить заново!")
     await callback_query.message.edit_caption(caption="❌ Отклонено.", reply_markup=None)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('harvest_'))
+async def harvest_plant(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    
+    parts = callback_query.data.split('_')
+    farmland_number = int(parts[1])
+    user_id = callback_query.from_user.id
+    
+    # Ищем, что было посажено на этой грядке в базе
+    db_cursor.execute('SELECT plant_type FROM farmlands WHERE user_id = ? AND farmland_number = ?', (user_id, farmland_number))
+    row = db_cursor.fetchone()
+    
+    if row and row[0]:
+        plant_type = row[0]
+        plant_name = PLANTS_DATA.get(plant_type, {}).get('name', 'Урожай')
+        
+        # Награды за сбор (можешь менять цифры под себя)
+        add_rewards(user_id, exp_to_add=20, coins_to_add=30, planted_to_add=1)
+        
+        # Очищаем грядку в базе (делаем снова пустой)
+        db_cursor.execute('''
+            UPDATE farmlands 
+            SET plant_type = NULL, plant_time = NULL, harvest_time = NULL 
+            WHERE user_id = ? AND farmland_number = ?
+        ''', (user_id, farmland_number))
+        db_conn.commit()
+        
+        await callback_query.answer(f"🎉 Ты собрал урожай: {plant_name}! Получено +20 опыта и +30 монет.", show_alert=True)
+        
+        # Обновляем экран грядок
+        user_data = get_user(user_id)
+        beds_text = (
+            f"🌱 **Твои грядки:**\n"
+            f"У тебя {user_data['farmlands_count']} грядок. Выбери свободную грядку для посадки.\n"
+            f"💰 Монет: {user_data['coins']}\n"
+        )
+        try:
+            await callback_query.message.edit_caption(caption=beds_text, reply_markup=get_farmland_keyboard(user_id), parse_mode="Markdown")
+        except Exception:
+            await callback_query.message.edit_text(text=beds_text, reply_markup=get_farmland_keyboard(user_id), parse_mode="Markdown")
+    else:
+        await callback_query.answer("❌ На этой грядке ничего не растет!", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data == 'rules')
 async def process_rules(callback_query: types.CallbackQuery):
