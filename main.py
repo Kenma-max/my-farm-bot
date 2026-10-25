@@ -529,4 +529,3 @@ if __name__ == '__main__':
     asyncio.set_event_loop(loop)
     print("Ферма запущена!")
     executor.start_polling(dp, skip_updates=True, loop=loop)
- 
