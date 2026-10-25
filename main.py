@@ -57,13 +57,28 @@ def init_db():
     
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, level INTEGER DEFAULT 0, exp INTEGER DEFAULT 0, coins INTEGER DEFAULT 0, planted INTEGER DEFAULT 0, products INTEGER DEFAULT 0, cooking INTEGER DEFAULT 0, farmlands_count INTEGER DEFAULT 1)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS farmlands (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, farmland_number INTEGER, plant_type TEXT, plant_time TEXT, harvest_time TEXT)''')
-    
+
     conn.commit()
+
+    db_cursor.execute('''
+        CREATE TABLE IF NOT EXISTS barn (
+            user_id INTEGER,
+            plant_type TEXT,
+            amount INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, plant_type)
+        )
+    ''')
+    # И добавим колонку вместимости амбара в таблицу users (если её там нет)
+    try:
+        db_cursor.execute('ALTER TABLE users ADD COLUMN barn_capacity INTEGER DEFAULT 15')
+    except sqlite3.OperationalError:
+        pass # Если колонка уже есть, просто идем дальше
+    db_conn.commit()
 
 def get_user(user_id):
     conn = sqlite3.connect('/data/farm.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT level, exp, coins, planted, products, cooking, farmlands_count FROM users WHERE user_id = ?', (user_id,))
+    cursor.execute('SELECT level, exp, coins, planted, products, cooking, farmlands_count, barn_capacity FROM users WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     
     if row is None:
@@ -78,8 +93,35 @@ def get_user(user_id):
         'planted': row[3],
         'products': row[4],
         'cooking': row[5],
-        'farmlands_count': row[6]
+        'farmlands_count': row[6],
+        'barn_capacity': row[7]
     }
+
+def add_to_barn(user_id, plant_type, count=1):
+    """Добавляет урожай в амбар с проверкой вместимости"""
+    user = get_user(user_id)
+    capacity = user.get('barn_capacity', 15)
+    
+    # Считаем, сколько всего предметов сейчас в амбаре
+    db_cursor.execute('SELECT SUM(amount) FROM barn WHERE user_id = ?', (user_id,))
+    res = db_cursor.fetchone()
+    total_in_barn = res[0] if res and res[0] else 0
+    
+    # Проверка на переполнение
+    if total_in_barn + count > capacity:
+        return False, f"⚠️ Амбар переполнен! ({total_in_barn}/{capacity}). Продай или используй продукты!"
+    
+    # Добавляем продукт
+    db_cursor.execute('SELECT amount FROM barn WHERE user_id = ? AND plant_type = ?', (user_id, plant_type))
+    row = db_cursor.fetchone()
+    
+    if row:
+        db_cursor.execute('UPDATE barn SET amount = amount + ? WHERE user_id = ? AND plant_type = ?', (count, user_id, plant_type))
+    else:
+        db_cursor.execute('INSERT INTO barn (user_id, plant_type, amount) VALUES (?, ?, ?)', (user_id, plant_type, count))
+    
+    db_conn.commit()
+    return True, f"📦 Урожай отправлен в амбар! ({total_in_barn + count}/{capacity})"
 
 def update_user_data(user_id, **kwargs):
     """Обновляет данные пользователя."""
@@ -515,18 +557,27 @@ async def harvest_plant(callback_query: types.CallbackQuery):
     farmland_number = int(parts[1])
     user_id = callback_query.from_user.id
     
-    # Ищем, что было посажено на этой грядке в базе
+    # Ищем, что было посажено
     db_cursor.execute('SELECT plant_type FROM farmlands WHERE user_id = ? AND farmland_number = ?', (user_id, farmland_number))
     row = db_cursor.fetchone()
     
     if row and row[0]:
         plant_type = row[0]
-        plant_name = PLANTS_DATA.get(plant_type, {}).get('name', 'Урожай')
+        plant_info = PLANTS_DATA.get(plant_type, {})
+        plant_name = plant_info.get('name', 'Урожай')
         
-        # Награды за сбор (можешь менять цифры под себя)
-        add_rewards(user_id, exp_to_add=20, coins_to_add=30, planted_to_add=1)
+        # Пытаемся положить в амбар
+        success, msg = add_to_barn(user_id, plant_type, count=1)
         
-        # Очищаем грядку в базе (делаем снова пустой)
+        if not success:
+            # Если амбар полный — не даем собрать!
+            await callback_query.answer(msg, show_alert=True)
+            return
+            
+        # Даем немного опыта за сбор
+        add_rewards(user_id, exp_to_add=15, coins_to_add=10, planted_to_add=0)
+        
+        # Очищаем грядку
         db_cursor.execute('''
             UPDATE farmlands 
             SET plant_type = NULL, plant_time = NULL, harvest_time = NULL 
@@ -534,13 +585,13 @@ async def harvest_plant(callback_query: types.CallbackQuery):
         ''', (user_id, farmland_number))
         db_conn.commit()
         
-        await callback_query.answer(f"🎉 Ты собрал урожай: {plant_name}! Получено +20 опыта и +30 монет.", show_alert=True)
+        await callback_query.answer(f"🎉 Собрано! {msg}", show_alert=True)
         
         # Обновляем экран грядок
         user_data = get_user(user_id)
         beds_text = (
             f"🌱 **Твои грядки:**\n"
-            f"У тебя {user_data['farmlands_count']} грядок. Выбери свободную грядку для посадки.\n"
+            f"У тебя {user_data['farmlands_count']} грядок. Выбери свободную для посадки.\n"
             f"💰 Монет: {user_data['coins']}\n"
         )
         try:
@@ -549,6 +600,36 @@ async def harvest_plant(callback_query: types.CallbackQuery):
             await callback_query.message.edit_text(text=beds_text, reply_markup=get_farmland_keyboard(user_id), parse_mode="Markdown")
     else:
         await callback_query.answer("❌ На этой грядке ничего не растет!", show_alert=True)
+
+@dp.callback_query_handler(lambda c: c.data == 'barn')
+async def process_barn(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    user_data = get_user(user_id)
+    capacity = user_data.get('barn_capacity', 50)
+    
+    # Достаем содержимое амбара из базы
+    db_cursor.execute('SELECT plant_type, amount FROM barn WHERE user_id = ?', (user_id,))
+    items = db_cursor.fetchall()
+    
+    total_items = sum(item[1] for item in items) if items else 0
+    
+    barn_text = f"📦 **Твой амбар**\n📊 Вместимость: **{total_items} / {capacity}**\n\n"
+    
+    if not items:
+        barn_text += "*Амбар пока пуст. Выращивай урожай на грядках и складывай сюда!*"
+    else:
+        barn_text += "**Содержимое:**\n"
+        for plant_type, amount in items:
+            plant_name = PLANTS_DATA.get(plant_type, {}).get('name', plant_type)
+            barn_text += f"• {plant_name}: **{amount} шт.**\n"
+            
+    kb = types.InlineKeyboardMarkup()
+    
+    try:
+        await callback_query.message.edit_caption(caption=barn_text, reply_markup=kb, parse_mode="Markdown")
+    except Exception:
+        await callback_query.message.edit_text(text=barn_text, reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query_handler(lambda c: c.data == 'rules')
 async def process_rules(callback_query: types.CallbackQuery):
